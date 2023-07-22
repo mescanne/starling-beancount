@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import sys
-from datetime import date
+from time import sleep
+from datetime import date, timedelta, datetime
 from decimal import Decimal
 from pathlib import Path
 from pprint import pprint
@@ -16,7 +17,7 @@ from beancount.core.flags import FLAG_OKAY
 from beancount.ingest.extract import print_extracted_entries  # type: ignore[import]
 from beancount.utils.date_utils import parse_date_liberally  # type: ignore[import]
 
-VALID_STATUS = ["REVERSED", "SETTLED", "REFUNDED"]
+VALID_STATUS = ["PENDING", "SETTLED"]
 
 
 def echo(it: str) -> None:
@@ -37,6 +38,15 @@ class Config:
         self.cps = config["cps"]
         self.joint = config["jointAccs"]
         self.users = config["userIds"]
+        self.fasterPayments = config.get("fasterPayments",{})
+
+
+def cleanup_string(s):
+    s = s.strip()
+    s = s.replace('_', ' ')
+    s = ''.join([w.capitalize() for w in s.split(' ') if not w.isdigit()])
+    s = ''.join([w for w in s if w.isalnum()])
+    return s
 
 
 class Account:
@@ -47,6 +57,7 @@ class Account:
         token_path: Path,
         verbose: bool = False,
     ) -> None:
+        self.last_request = None
         self.acc = acc
         self.verbose = verbose
         self.conf = Config(config_path=config_path)
@@ -55,11 +66,21 @@ class Account:
         self.headers = {"Authorization": f"Bearer {self.token}"}
         self.uid = self.get_uid()
         self.today = date.today()
+        self.tomorrow = self.today + timedelta(days=1)
         self.start = self.today
+        self.spaces = self.spaces()
+
+
+    def _httpx_get(self, *args, **kwargs):
+        if (self.last_request is not None and
+            (datetime.now() - self.last_request) < timedelta(microseconds=200000)):
+            sleep((datetime.now() - self.last_request).total_seconds())
+        self.last_request = datetime.now()
+        return httpx.get(*args, **kwargs)
 
     def get_uid(self) -> str:
         url = "/api/v2/accounts"
-        r = httpx.get(self.conf.base + url, headers=self.headers)
+        r = self._httpx_get(self.conf.base + url, headers=self.headers)
         data = r.json()
         try:
             uid = str(data["accounts"][0]["accountUid"])
@@ -70,107 +91,161 @@ class Account:
             log(f"{uid}")
         return uid
 
-    def get_balance_data(self) -> Decimal:
+    def get_balance_data(self) -> (str, Decimal):
         url = f"/api/v2/accounts/{self.uid}/balance"
-        r = httpx.get(self.conf.base + url, headers=self.headers)
+        r = self._httpx_get(self.conf.base + url, headers=self.headers)
         data = r.json()
         if self.verbose:
             log(data)
-        bal = Decimal(data["totalClearedBalance"]["minorUnits"]) / 100
-        return bal
+        bal = Decimal(data["effectiveBalance"]["minorUnits"]) / 100
+        return data["effectiveBalance"]["currency"], bal
 
-    def balance(self, display: bool = False) -> Balance:
-        bal = self.get_balance_data()
-        amt = Amount(bal, "GBP")
-        meta = new_metadata("starling-api", 999)
+    def balances(self, display: bool = False) -> Balance:
+        balances = []
 
-        balance = Balance(meta, self.today, self.account_name, amt, None, None)
+        for category, info in self.spaces.items():
+            amt = Amount(info["balance"], info["ccy"])
+            meta = new_metadata("starling-api", 999)
+
+            bal = Balance(meta, self.tomorrow, self.account_name + info["name"], amt, None, None)
+            balances.append(bal)
+
         if display:
-            print_extracted_entries([balance], file=sys.stdout)
+            print_extracted_entries(balances, file=sys.stdout)
 
-        return balance
+        return balances
 
     def note(self) -> Note:
         meta_end = new_metadata("starling-api", 998)
         note_end = Note(meta_end, self.today, self.account_name, "end bean-extract")
         return note_end
 
-    def spaces(self) -> list[str]:
-        # get default category UID
-        url = "/api/v2/accounts"
-        r = httpx.get(self.conf.base + url, headers=self.headers)
-        default_category = r.json()["accounts"][0]["defaultCategory"]
+    def spaces(self) -> dict[str,str]:
 
         # get spaces
+        spaces_categories = {}
         url = f"/api/v2/account/{self.uid}/spaces"
-        r = httpx.get(self.conf.base + url, headers=self.headers)
+        r = self._httpx_get(self.conf.base + url, headers=self.headers)
         data = r.json()
         if "error" in data:
             echo(f"Error: {data['error_description']}")
             sys.exit(1)
-        try:
-            spaces_categories = [sp["savingsGoalUid"] for sp in data["savingsGoals"]]
-        except KeyError:
-            spaces_categories = []
+        for sp in data["savingsGoals"]:
+            spaces_categories[sp["savingsGoalUid"]] = {
+                'name': sp["name"],
+                'ccy': sp["totalSaved"]["currency"],
+                'balance': Decimal(sp["totalSaved"]["minorUnits"]) / 100,
+            }
+        for sp in data["spendingSpaces"]:
+            spaces_categories[sp["spaceUid"]] = {
+                'name': sp["name"],
+                'ccy': sp["balance"]["currency"],
+                'balance': Decimal(sp["balance"]["minorUnits"]) / 100,
+            }
+
+        # get default category
+        url = "/api/v2/accounts"
+        r = self._httpx_get(self.conf.base + url, headers=self.headers)
+        uid = r.json()["accounts"][0]["defaultCategory"]
+        default_ccy, default_balance = self.get_balance_data()
+        spaces_categories[uid] = {
+           'name': '',
+           'balance': default_balance,
+           'ccy': default_ccy,
+        }
 
         if self.verbose:
-            log(default_category)
             log(spaces_categories)
 
-        return [default_category] + spaces_categories
+        return spaces_categories
 
     def get_transaction_data(self, since: date) -> list[dict]:
-        categories = self.spaces()
 
         all_data = []
-        for category in categories:
+        for category, info in self.spaces.items():
             url = f"/api/v2/feed/account/{self.uid}/category/{category}/transactions-between"
             params = {
                 "minTransactionTimestamp": f"{since}T00:00:00.000Z",
                 "maxTransactionTimestamp": "2100-01-01T00:00:00.000Z",
             }
-            r = httpx.get(
+            r = self._httpx_get(
                 self.conf.base + url,
                 params=params,
                 headers=self.headers,
             )
             data = r.json()
-            all_data.extend(data["feedItems"])
+            feedItems = data["feedItems"]
+            for f in feedItems:
+                f["space"] = info["name"]
+            all_data.extend(feedItems)
         return sorted(all_data, key=lambda x: str(x["transactionTime"]))
+
+    def get_counter_account(self, item) -> str:
+
+        # Try faster payments
+        if (item["source"] == 'FASTER_PAYMENTS_IN' or
+             item["source"] == 'FASTER_PAYMENTS_OUT'):
+
+            if 'counterPartySubEntityIdentifier' in item:
+                acct = (item['counterPartySubEntityIdentifier'] + '-' +
+                        item['counterPartySubEntitySubIdentifier'])
+
+                if acct in self.conf.fasterPayments:
+                    return self.conf.fasterPayments[acct]
+
+        # Try internal transfers
+        if item["source"] == "INTERNAL_TRANSFER":
+            return self.account_name + cleanup_string(item["counterPartyName"])
+
+        # Try spending category
+        if item["spendingCategory"] in self.conf.cps:
+            return self.conf.cps[item["spendingCategory"]]
+
+        # Default category
+        cp = self.conf.cps["DEFAULT"]
+        cp = cp.replace('<CATEGORY>',
+                   cleanup_string(item["spendingCategory"]))
+        return cp
+
 
     def transactions(self, since: date, display: bool = False) -> list[Transaction]:
         tr = self.get_transaction_data(since)
         txns = []
         for i, item in enumerate(tr):
+
             if self.verbose:
                 log(item)
-            if (
-                item["source"] == "INTERNAL_TRANSFER"
-                or item["status"] not in VALID_STATUS
-            ):
+
+            # If internal and it's a space, skip it
+            if item["source"] == "INTERNAL_TRANSFER" and item["space"] != "":
                 continue
 
-            date = parse_date_liberally(item["transactionTime"])
-            payee = item.get("counterPartyName", "FIXME")
-            ref = " ".join(item["reference"].split())
-            amt = Decimal(item["amount"]["minorUnits"]) / 100
-            amt = amt if item["direction"] == "IN" else -amt
-
-            user = item.get("transactingApplicationUserUid", None)
-            if user and self.acc in self.conf.joint:
-                user = self.conf.users[user]
-            else:
-                # must add this to not get unwanted UIDs returned
-                user = None
+            # Check status
+            if item["status"] not in VALID_STATUS:
+                continue
 
             try:
-                cp = self.conf.cps[item["spendingCategory"]]
-            except KeyError:
-                cp = self.conf.cps["DEFAULT"]
+                date = parse_date_liberally(item["transactionTime"])
+                payee = item.get("counterPartyName", "FIXME")
+                ref = " ".join(item.get("reference","").split())
+                amt = Decimal(item["amount"]["minorUnits"]) / 100
+                amt = amt if item["direction"] == "IN" else -amt
+
+                user = item.get("transactingApplicationUserUid", None)
+                if user and self.acc in self.conf.joint:
+                    user = self.conf.users[user]
+                else:
+                    # must add this to not get unwanted UIDs returned
+                    user = None
+                
+                cp = self.get_counter_account(item)
+            except Exception as e:
+                print(f'failed on {item}: {e}', file=sys.stderr)
+                raise e
 
             extra_meta = {"user": user} if user else None
             meta = new_metadata("starling-api", i, extra_meta)
-            p1 = Posting(self.account_name, Amount(amt, "GBP"), None, None, None, None)
+            p1 = Posting(self.account_name + item["space"], Amount(amt, "GBP"), None, None, None, None)
             p2 = Posting(cp, None, None, None, None, None)  # type: ignore[arg-type]
             txn = Transaction(
                 meta=meta,
@@ -202,9 +277,9 @@ def extract(
     """bean-extract entrypoint"""
     account = Account(config_path=config_path, acc=acc, token_path=token_path)
     txns = account.transactions(since)
-    bal = account.balance()
+    bals = account.balances()
     note = account.note()
-    return [*txns, bal, note]
+    return [*txns, *bals, note]
 
 
 def main(

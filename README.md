@@ -53,15 +53,18 @@ starling assets_starling --balance
 ## 🧠 As a beancount importer
 You will need to add something like the following to your `bean-extract` configuration (eg `config.py`):
 ```python
+
+from pathlib import Path
+
 from starling_beancount.importer import StarlingImporter
 
 CONFIG = [
     ...,
     StarlingImporter(
-        config_path="path/to/config.yml",
+        config_path=Path("path/to/config.yml"),
         acc="assets_starling",
-        token_path="path/to/token.txt",
-        bean_path="path/to/ledger.bean",
+        token_path=Path("path/to/token.txt"),
+        bean_path=Path("path/to/ledger.bean"),
     ),
 ]
 ```
